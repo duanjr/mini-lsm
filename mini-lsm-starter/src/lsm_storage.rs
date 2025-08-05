@@ -15,15 +15,18 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
+use std::clone;
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
+use std::iter;
 
 use anyhow::Result;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
+use serde::de::value;
 
 use crate::block::Block;
 use crate::compact::{
@@ -32,7 +35,7 @@ use crate::compact::{
 };
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
 use crate::table::SsTable;
 
@@ -298,7 +301,27 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-        unimplemented!()
+
+        let state_reader = self.state.read();
+        let active_memtable = state_reader.memtable.clone();
+        let imm_memtables = state_reader.imm_memtables.clone();
+        drop(state_reader);
+
+        // Search in the active memtable first, then in the immutable memtables.
+        let mut memtable_chain = iter::once(&active_memtable).chain(imm_memtables.iter());
+
+        let search_result: Option<Bytes> = memtable_chain.find_map(|memtable| memtable.get(_key));
+
+        let final_result = search_result.and_then(|value| {
+            if value.is_empty() {
+                // If the value is empty, it means the key was deleted.
+                None
+            } else {
+                Some(value)
+            }
+        });
+
+        Ok(final_result)
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -308,12 +331,21 @@ impl LsmStorageInner {
 
     /// Put a key-value pair into the storage by writing into the current memtable.
     pub fn put(&self, _key: &[u8], _value: &[u8]) -> Result<()> {
-        unimplemented!()
+        let state_reader = self.state.read();
+        let mem_table_instance = state_reader.memtable.clone();
+        drop(state_reader);
+        let result = mem_table_instance.put(_key, _value);
+        if mem_table_instance.approximate_size() > self.options.target_sst_size {
+            // If the memtable size exceeds the target size, we need to flush it to disk.
+            self.force_freeze_memtable(&self.state_lock.lock())?;
+        }
+        result
     }
 
     /// Remove a key from the storage by writing an empty value.
     pub fn delete(&self, _key: &[u8]) -> Result<()> {
-        unimplemented!()
+        let _value = &[]; // Empty value for deletion
+        self.put(_key, _value) // Empty value for deletion
     }
 
     pub(crate) fn path_of_sst_static(path: impl AsRef<Path>, id: usize) -> PathBuf {
@@ -338,7 +370,13 @@ impl LsmStorageInner {
 
     /// Force freeze the current memtable to an immutable memtable
     pub fn force_freeze_memtable(&self, _state_lock_observer: &MutexGuard<'_, ()>) -> Result<()> {
-        unimplemented!()
+        let new_memtable = Arc::new(MemTable::create(self.next_sst_id()));
+        let mut state_writer = self.state.write();
+        let mut new_state = state_writer.as_ref().clone();
+        let old_memtable = std::mem::replace(&mut new_state.memtable, new_memtable);
+        new_state.imm_memtables.insert(0, old_memtable);
+        *state_writer = Arc::new(new_state);
+        Ok(())
     }
 
     /// Force flush the earliest-created immutable memtable to disk
