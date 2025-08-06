@@ -17,13 +17,13 @@
 
 use std::clone;
 use std::collections::HashMap;
+use std::iter;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
-use std::iter;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use serde::de::value;
@@ -33,7 +33,8 @@ use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
-use crate::lsm_iterator::{FusedIterator, LsmIterator};
+use crate::iterators::merge_iterator::MergeIterator;
+use crate::lsm_iterator::{self, FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{self, MemTable};
 use crate::mvcc::LsmMvccInner;
@@ -301,7 +302,6 @@ impl LsmStorageInner {
 
     /// Get a key from the storage. In day 7, this can be further optimized by using a bloom filter.
     pub fn get(&self, _key: &[u8]) -> Result<Option<Bytes>> {
-
         let state_reader = self.state.read();
         let active_memtable = state_reader.memtable.clone();
         let imm_memtables = state_reader.imm_memtables.clone();
@@ -395,6 +395,18 @@ impl LsmStorageInner {
         _lower: Bound<&[u8]>,
         _upper: Bound<&[u8]>,
     ) -> Result<FusedIterator<LsmIterator>> {
-        unimplemented!()
+        let state_reader = self.state.read();
+        let active_memtable = state_reader.memtable.clone();
+        let imm_memtables = state_reader.imm_memtables.clone();
+        drop(state_reader);
+
+        let mut iters = Vec::new();
+        iters.push(Box::new(active_memtable.scan(_lower, _upper)));
+        for imm_memtable in imm_memtables {
+            iters.push(Box::new(imm_memtable.scan(_lower, _upper)));
+        }
+        let merge_iter = MergeIterator::create(iters);
+        let lsm_iter = LsmIterator::new(merge_iter)?;
+        Ok(FusedIterator::new(lsm_iter))
     }
 }

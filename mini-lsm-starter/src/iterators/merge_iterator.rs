@@ -17,8 +17,9 @@
 
 use std::cmp::{self};
 use std::collections::BinaryHeap;
+use std::iter;
 
-use anyhow::Result;
+use anyhow::{Ok, Result};
 
 use crate::key::KeySlice;
 
@@ -59,7 +60,18 @@ pub struct MergeIterator<I: StorageIterator> {
 
 impl<I: StorageIterator> MergeIterator<I> {
     pub fn create(iters: Vec<Box<I>>) -> Self {
-        unimplemented!()
+        let mut heap = BinaryHeap::new();
+        for (index, iter) in iters.into_iter().enumerate() {
+            if iter.is_valid() {
+                heap.push(HeapWrapper(index, iter));
+            }
+        }
+        let mut merge_iter = MergeIterator {
+            iters: heap,
+            current: None,
+        };
+        merge_iter.current = merge_iter.iters.pop();
+        merge_iter
     }
 }
 
@@ -69,18 +81,58 @@ impl<I: 'static + for<'a> StorageIterator<KeyType<'a> = KeySlice<'a>>> StorageIt
     type KeyType<'a> = KeySlice<'a>;
 
     fn key(&self) -> KeySlice {
-        unimplemented!()
+        self.current
+            .as_ref()
+            .map_or(KeySlice::from_slice(&[]), |c| c.1.key())
     }
 
     fn value(&self) -> &[u8] {
-        unimplemented!()
+        self.current.as_ref().map_or(&[], |c| c.1.value())
     }
 
     fn is_valid(&self) -> bool {
-        unimplemented!()
+        self.current.is_some() && self.current.as_ref().unwrap().1.is_valid()
     }
 
+    /// Using `peek_mut()` in this function is not recommended, as it may lead to very complicated
+    /// code. Instead, use `pop()` and `push()` to manage the heap even if they are more expensive.
     fn next(&mut self) -> Result<()> {
-        unimplemented!()
+        if self.current.is_none() {
+            return Ok(());
+        }
+
+        // clean initial duplicates
+        while self.iters.peek().is_some()
+            && self.iters.peek().unwrap().1.key() == self.current.as_ref().unwrap().1.key()
+        {
+            let mut next = self.iters.pop().unwrap();
+            next.1.next()?;
+            if next.1.is_valid() {
+                self.iters.push(next);
+            }
+        }
+
+        //resume from current
+        let mut current = self.current.take().unwrap();
+        current.1.next()?;
+        if current.1.is_valid() {
+            self.iters.push(current);
+        }
+        self.current = self.iters.pop();
+        if self.current.is_none() {
+            return Ok(());
+        }
+
+        // clean duplicates after current
+        while self.iters.peek().is_some()
+            && self.iters.peek().unwrap().1.key() == self.current.as_ref().unwrap().1.key()
+        {
+            let mut next = self.iters.pop().unwrap();
+            next.1.next()?;
+            if next.1.is_valid() {
+                self.iters.push(next);
+            }
+        }
+        Ok(())
     }
 }
