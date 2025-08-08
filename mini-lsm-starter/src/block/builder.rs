@@ -76,4 +76,8 @@ impl BlockBuilder {
             offsets: self.offsets,
         }
     }
+
+    pub fn first_key(&self) -> &KeyVec {
+        &self.first_key
+    }
 }
