@@ -15,7 +15,6 @@
 #![allow(unused_variables)] // TODO(you): remove this lint after implementing this mod
 #![allow(dead_code)] // TODO(you): remove this lint after implementing this mod
 
-use std::clone;
 use std::collections::HashMap;
 use std::iter;
 use std::ops::Bound;
@@ -26,19 +25,21 @@ use std::sync::atomic::AtomicUsize;
 use anyhow::{Ok, Result};
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use serde::de::value;
 
 use crate::block::Block;
 use crate::compact::{
     CompactionController, CompactionOptions, LeveledCompactionController, LeveledCompactionOptions,
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
+use crate::iterators::StorageIterator;
 use crate::iterators::merge_iterator::MergeIterator;
-use crate::lsm_iterator::{self, FusedIterator, LsmIterator};
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::key::KeySlice;
+use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::{self, MemTable};
+use crate::mem_table::MemTable;
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -305,6 +306,8 @@ impl LsmStorageInner {
         let state_reader = self.state.read();
         let active_memtable = state_reader.memtable.clone();
         let imm_memtables = state_reader.imm_memtables.clone();
+        let l0_sstables = state_reader.l0_sstables.clone();
+        let sstables = state_reader.sstables.clone();
         drop(state_reader);
 
         // Search in the active memtable first, then in the immutable memtables.
@@ -312,7 +315,7 @@ impl LsmStorageInner {
 
         let search_result: Option<Bytes> = memtable_chain.find_map(|memtable| memtable.get(_key));
 
-        let final_result = search_result.and_then(|value| {
+        let mem_result = search_result.and_then(|value| {
             if value.is_empty() {
                 // If the value is empty, it means the key was deleted.
                 None
@@ -321,7 +324,30 @@ impl LsmStorageInner {
             }
         });
 
-        Ok(final_result)
+        if mem_result.is_some() {
+            return Ok(mem_result);
+        }
+        let mut sst_iters = Vec::new();
+        for sst_id in l0_sstables {
+            let sst = sstables.get(&sst_id).unwrap();
+            sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                sst.clone(),
+                KeySlice::from_slice(_key),
+            )?));
+        }
+        let mut merge_sst_iter = MergeIterator::create(sst_iters);
+
+        while merge_sst_iter.is_valid()
+            && merge_sst_iter.key() == KeySlice::from_slice(_key)
+            && merge_sst_iter.value().is_empty()
+        {
+            merge_sst_iter.next()?;
+        }
+        if merge_sst_iter.is_valid() && merge_sst_iter.key() == KeySlice::from_slice(_key) {
+            Ok(Some(Bytes::from(merge_sst_iter.value().to_vec())))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Write a batch of data into the storage. Implement in week 2 day 7.
@@ -398,15 +424,54 @@ impl LsmStorageInner {
         let state_reader = self.state.read();
         let active_memtable = state_reader.memtable.clone();
         let imm_memtables = state_reader.imm_memtables.clone();
+        let l0_sstables = state_reader.l0_sstables.clone();
+        let sstables: HashMap<usize, Arc<SsTable>> = state_reader.sstables.clone();
         drop(state_reader);
 
-        let mut iters = Vec::new();
-        iters.push(Box::new(active_memtable.scan(_lower, _upper)));
+        let mut mem_iters = Vec::new();
+        mem_iters.push(Box::new(active_memtable.scan(_lower, _upper)));
         for imm_memtable in imm_memtables {
-            iters.push(Box::new(imm_memtable.scan(_lower, _upper)));
+            mem_iters.push(Box::new(imm_memtable.scan(_lower, _upper)));
         }
-        let merge_iter = MergeIterator::create(iters);
-        let lsm_iter = LsmIterator::new(merge_iter)?;
+
+        let mut sst_iters = Vec::new();
+        for sst_id in l0_sstables {
+            let sst = sstables.get(&sst_id).unwrap();
+            match _lower {
+                Bound::Included(lower) => {
+                    sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                        sst.clone(),
+                        KeySlice::from_slice(lower),
+                    )?));
+                }
+                Bound::Excluded(lower) => {
+                    let mut iter = SsTableIterator::create_and_seek_to_key(
+                        sst.clone(),
+                        KeySlice::from_slice(lower),
+                    )?;
+                    if iter.is_valid() && iter.key() == KeySlice::from_slice(lower) {
+                        iter.next()?;
+                    }
+                    sst_iters.push(Box::new(iter));
+                }
+                Bound::Unbounded => {
+                    sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_first(
+                        sst.clone(),
+                    )?));
+                }
+            }
+        }
+        let merge_mem_iter = MergeIterator::create(mem_iters);
+        let merge_sst_iter = MergeIterator::create(sst_iters);
+        let upper = match _upper {
+            Bound::Included(upper) => Bound::Included(Bytes::from(upper.to_vec())),
+            Bound::Excluded(upper) => Bound::Excluded(Bytes::from(upper.to_vec())),
+            Bound::Unbounded => Bound::Unbounded,
+        };
+        let lsm_iter = LsmIterator::new(
+            TwoMergeIterator::create(merge_mem_iter, merge_sst_iter)?,
+            upper,
+        )?;
         Ok(FusedIterator::new(lsm_iter))
     }
 }

@@ -84,7 +84,7 @@ impl SsTableBuilder {
     /// Since the data blocks contain much more data than meta blocks, just return the size of data
     /// blocks here.
     pub fn estimated_size(&self) -> usize {
-        return self.data.len() + self.meta.len() * 16; // 16 bytes for each BlockMeta's estimated size
+        self.data.len() + self.meta.len() * 16 // 16 bytes for each BlockMeta's estimated size
     }
 
     /// Builds the SSTable and writes it to the given path. Use the `FileObject` structure to manipulate the disk objects.

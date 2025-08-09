@@ -15,20 +15,32 @@
 use anyhow::Result;
 
 use crate::{
-    iterators::{StorageIterator, merge_iterator::MergeIterator},
+    iterators::{
+        StorageIterator, merge_iterator::MergeIterator, two_merge_iterator::TwoMergeIterator,
+    },
+    key::Key,
     mem_table::MemTableIterator,
+    table::SsTableIterator,
 };
 
+use bytes::Bytes;
+use std::ops::Bound;
+
 /// Represents the internal type for an LSM iterator. This type will be changed across the course for multiple times.
-type LsmIteratorInner = MergeIterator<MemTableIterator>;
+type LsmIteratorInner =
+    TwoMergeIterator<MergeIterator<MemTableIterator>, MergeIterator<SsTableIterator>>;
 
 pub struct LsmIterator {
     inner: LsmIteratorInner,
+    end_bound: Bound<Bytes>,
 }
 
 impl LsmIterator {
-    pub(crate) fn new(iter: LsmIteratorInner) -> Result<Self> {
-        let mut iter = Self { inner: iter };
+    pub(crate) fn new(iter: LsmIteratorInner, end_bound: Bound<Bytes>) -> Result<Self> {
+        let mut iter = Self {
+            inner: iter,
+            end_bound,
+        };
         while iter.inner.is_valid() && iter.inner.value().is_empty() {
             // Skip empty values
             iter.inner.next()?;
@@ -52,6 +64,17 @@ impl StorageIterator for LsmIterator {
         self.inner.value()
     }
     fn next(&mut self) -> Result<()> {
+        if self.inner.is_valid() && self.end_bound != Bound::Unbounded {
+            match &self.end_bound {
+                Bound::Included(end) if self.inner.key() > Key::from_slice(end.as_ref()) => {
+                    return Ok(());
+                }
+                Bound::Excluded(end) if self.inner.key() >= Key::from_slice(end.as_ref()) => {
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         self.inner.next()?;
         while self.inner.is_valid() && self.inner.value().is_empty() {
             // Skip empty values
